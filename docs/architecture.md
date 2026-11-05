@@ -39,7 +39,10 @@ Windows では `run.bat` を使う。プロジェクトルートへ移動し、`
 | `config.py` | 環境変数の読み込み・検証 |
 | `login.py` | ログイン処理（メール / QR） |
 | `list_items.py` | メッセージ一覧の取得（ページネーション） |
-| `user_profile.py` | 相手ユーザーのユーザーページからプロフィールを取得（シェルのコマンドからはまだ呼ばれない） |
+| `user_profile.py` | 相手ユーザーのユーザーページからプロフィールを取得 |
+| `profile_collector.py` | 一覧の相手のプロフィールを取得して DB に保存（`save_profiles`） |
+| `profile_db.py` | プロフィール DB（SQLite）の接続・保存・検索 |
+| `profile_export.py` | 検索結果の JSON / CSV 出力（`search_profiles`） |
 | `chat_reply.py` | Claude API による返信文下書きの生成 |
 | `logging_config.py` | `logs/YYYYMMDD_HHMMSS.log` と標準出力へのログ設定 |
 
@@ -51,6 +54,22 @@ Windows では `run.bat` を使う。プロジェクトルートへ移動し、`
 - **QRログイン**: QRコード画面のスクリーンショットを保存した後、URL から `sign-in-dialog` が消えるまで無期限（`timeout=0`）に待つ。トップページに戻った場合はログイン失敗とみなし `LoginAborted` を送出する（シェルは警告として扱う）。
 - **一覧取得はジェネレータ**: `iter_items()` は `/messages?page=N` を順に開き、1件ずつ `{"link", "name", "age"}` の dict を yield する。アイテムが0件のページに達するか、`limit` 件に達したら終了する。シェルは各件を JSON Lines で標準出力に書き出す。ページ遷移前に `LIST_MIN_SLEEP_SECONDS`〜`LIST_MAX_SLEEP_SECONDS` 秒のランダムsleepを入れる。
 - **プロフィール取得は bs4 で解析**: `user_profile.py` では、Playwright はページを開いて `page.content()` で HTML を受け取るところまでにとどめ、HTML の解析は BeautifulSoup（`html.parser`）で行う。ページを開く `fetch_user_profile()` と HTML を解析する `parse_user_profile()` を分けているので、解析処理はブラウザなしで確認できる。`fetch_user_profile()` が開くのは1回の呼び出しにつき1ページだけで、sleep は持たない。複数ユーザーを続けて取得するときの待機は呼び出し側で行うこと。プロフィール本文は第三者の個人情報なので、ログには件数と欠けた項目名だけを出す。仕様は [docs/specs/user-profile-scrape/](specs/user-profile-scrape/)。
-- **確認用スクリプト**: `PYTHONPATH=src python scripts/check_user_profile.py` で、`sample/htiw_user_page.html` などを使って `parse_user_profile()` の結果を期待値と比べる。期待値と違う項目があれば、終了コード1で終わる。セレクタを直した後に実行すること。
+- **プロフィールの保存（`save_profiles`）**: `profile_collector.save_profiles()` は、`iter_items()` の結果を**先にすべて list にしてから**ユーザーページを開く。`iter_items()` は同じページの locator を読みながら yield するため、途中でページを遷移すると一覧の残りが読めなくなるからである。
+  - 保存済みのユーザーIDはアクセスせずにスキップする。
+  - ユーザーページを開く前には、毎回 `LIST_*_SLEEP_SECONDS` の待機を入れる。
+  - 3人連続で失敗したら `TooManyFailures` で中止する。
+  - 1人ごとに commit する。
+  - `do_save_profiles` は `KeyboardInterrupt` を自分で捕捉して、シェルに戻る。
+  - 一覧の `link` からユーザーIDを取り出す正規表現は `USER_ID_PATTERN`（`/messages/<ID>` を想定）。仕様は [docs/specs/profile-save/](specs/profile-save/)。
+- **プロフィール DB**: `profile_db.py` の `profiles` テーブル（1人1行）。共通点・好みカード（列名 `group_cards`）・登録傾向・基本情報は JSON 文字列の列で持つ。年齢の範囲検索用に `age_years` 列を持つ。
+  - SQL の値は必ずプレースホルダで渡す。
+  - 検索のキーワードは `json_each()` で JSON の値だけを照合する。基本情報の項目名に一致させないためである。
+  - 検索は `connect_readonly()`（`mode=ro`）で開き、DBファイルがなければ作らずに `DbNotFound` を送出する。
+  - 仕様は [docs/specs/profile-search/](specs/profile-search/)。
+- **検索結果の出力**: ログは標準エラーに出る（`logging_config.py` の `StreamHandler()`）。そのため、`search_profiles` が標準出力に出すのは結果だけにし、他のツールにそのまま渡せるようにする。CSV は、ファイルなら BOM 付き UTF-8 と `\r\n`、標準出力なら `\n` で書く。Windows では標準出力の `\n` が `\r\n` に変換されるためである。
+- **確認用スクリプト**: `scripts/` 配下のスクリプトは、サイトにアクセスせずに期待値と比べ、違う項目があれば終了コード1で終わる。プロジェクトルートから `PYTHONPATH=src python scripts/<名前>.py` で実行する。
+  - `check_user_profile.py`: `sample/htiw_user_page.html` を `parse_user_profile()` で解析した結果を確かめる。セレクタを直した後に実行すること。
+  - `check_profile_save.py`: DB への保存と `save_profiles()` の流れを確かめる。一覧・プロフィール取得・sleep は差し替える。
+  - `check_profile_search.py`: 検索条件・JSON / CSV 出力・性能（1,000件）を確かめる。
 - **返信文の下書き**: `chat_reply.py` は入力 JSON（`[{"sender", "text"}]`）を `sender: text` 形式のテキストに変換し、`SYSTEM_PROMPT` とともに Messages API へ1回だけ送って本文を返す。送信処理は持たない。モデル名は `MODEL` 定数で指定する。プロンプトを変える際は [docs/prompt-guidelines.md](prompt-guidelines.md) に従う（元になった方針は `prompts/chat.md`）。
 - **README の表示**: `readme` コマンドは `shell.py` から2階層上（プロジェクトルート）の `README.md` を読む。`shell.py` を別の階層へ移す場合は `README_PATH` も直すこと。
