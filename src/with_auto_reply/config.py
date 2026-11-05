@@ -58,3 +58,15 @@ def load_list_config() -> ListConfig:
         min_sleep_seconds=min_sleep_seconds,
         max_sleep_seconds=max_sleep_seconds,
     )
+
+
+@dataclass(frozen=True)
+class DbConfig:
+    path: str
+
+
+def load_db_config() -> DbConfig:
+    path = os.environ.get("DB_PATH", "db.sqlite")
+    if not path:
+        raise RuntimeError("環境変数 DB_PATH が空です")
+    return DbConfig(path=path)

@@ -6,6 +6,12 @@
 # ログイン用QRコード
 qr_login.png
 
+# ===== 個人情報 =====
+# 相手のプロフィールを保存するDB（save_profiles が作成。DB_PATH で変更可）
+db.sqlite
+*.sqlite
+*.sqlite-journal
+
 # ===== プロジェクト固有 =====
 # 仕様ドキュメント
 docs/specs/
