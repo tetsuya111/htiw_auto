@@ -1,0 +1,55 @@
+# ===== 秘密情報 =====
+# ログイン情報・APIキー（.env.example はテンプレートなので追跡する）
+.env
+.env.*
+!.env.example
+# ログイン用QRコード
+qr_login.png
+
+# ===== プロジェクト固有 =====
+# 仕様ドキュメント
+docs/specs/
+# プログラムの実行ログ（logging_config.py が出力）
+logs/
+*.log
+# 作業ログ
+worklogs/
+# 対象サイトから保存したサンプルHTML
+sample/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 仮想環境
+venv/
+.venv/
+env/
+
+# テスト・型チェック・リンタのキャッシュ
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ===== Playwright =====
+test-results/
+playwright-report/
+playwright/.cache/
+
+# ===== エディタ・OS =====
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Claude Code（個人設定） =====
+.claude/settings.local.json
