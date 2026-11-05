@@ -9,13 +9,14 @@ from docopt import DocoptExit, docopt
 from playwright.sync_api import Page, sync_playwright
 
 from . import profile_db
+from .chat_history import LAST_SENDER_LABELS, LastSender, check_chats
 from .chat_reply import generate_reply_draft
 from .config import load_db_config, load_list_config, load_login_config
 from .list_items import iter_items
 from .login import LoginAborted, login_email, login_with_email
 from .logging_config import setup_logging
 from .profile_collector import TooManyFailures, save_profiles
-from .profile_export import FORMATS, write_results
+from .profile_export import ALL_COLUMNS, FORMATS, parse_fields, write_results
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +59,21 @@ Options:
   --limit=<n>        出力する最大件数
   --format=<fmt>     json または csv [default: json]
   --output=<path>    書き出すファイル（省略時は標準出力）
+  --fields=<keys>    出力するキーをカンマ区切りで指定（省略時はすべて。例: user_id,nickname,last_sender）
+"""
+
+CHECK_CHATS_USAGE = """チャットで最後に送信したのがどちらかと、メッセージ件数を確認して DB に記録する
+（チャットページを開いて読むだけで、送信はしません）
+
+Usage:
+  check_chats [<count>] [--user-id=<id>]
+
+  <count>          保存済みの相手のうち、取得日時の新しい順に確認する件数（省略時はすべて）
+  --user-id=<id>   このユーザーIDの相手だけを確認する（<count> より優先）
 """
 
 SAVE_STATUS_LABELS = {"saved": "保存", "skipped": "スキップ（保存済み）", "failed": "失敗"}
+CHECK_COUNT_KEYS = {LastSender.NONE: "none", LastSender.ME: "me", LastSender.OTHER: "other"}
 
 
 class UsageError(ValueError):
@@ -79,7 +92,9 @@ def _parse_non_negative_int(value: str | None, name: str) -> int | None:
     return number
 
 
-def _parse_search_args(args: dict) -> tuple[profile_db.SearchCriteria, str, str | None]:
+def _parse_search_args(
+    args: dict,
+) -> tuple[profile_db.SearchCriteria, str, str | None, tuple[str, ...] | None]:
     fmt = args["--format"]
     if fmt not in FORMATS:
         raise UsageError(f"--format には {' / '.join(FORMATS)} を指定してください")
@@ -101,7 +116,13 @@ def _parse_search_args(args: dict) -> tuple[profile_db.SearchCriteria, str, str 
     ):
         if low is not None and high is not None and low > high:
             raise UsageError(f"{label} 以下にしてください")
-    return criteria, fmt, args["--output"]
+    fields = None
+    if args["--fields"] is not None:
+        try:
+            fields = parse_fields(args["--fields"])
+        except ValueError as exc:
+            raise UsageError(f"{exc}\n指定できるキー: {', '.join(ALL_COLUMNS)}") from None
+    return criteria, fmt, args["--output"], fields
 
 
 class WithAutoReplyShell(cmd.Cmd):
@@ -257,7 +278,7 @@ class WithAutoReplyShell(cmd.Cmd):
     def do_search_profiles(self, arg: str) -> None:
         try:
             args = docopt(SEARCH_PROFILES_USAGE, argv=shlex.split(arg), default_help=False)
-            criteria, fmt, output = _parse_search_args(args)
+            criteria, fmt, output, fields = _parse_search_args(args)
         except UsageError as exc:
             print(exc)
             print(SEARCH_PROFILES_USAGE)
@@ -273,13 +294,15 @@ class WithAutoReplyShell(cmd.Cmd):
             rows = profile_db.search_profiles(conn, criteria)
             # 条件の値・結果の本文は個人情報になりうるのでログに出さない
             logger.info(
-                "search_profiles: 条件=%s, 形式=%s, ファイル出力=%s, 件数=%d",
+                "search_profiles: 条件=%s, 形式=%s, ファイル出力=%s, 出力項目=%s, チャット履歴テーブル=%s, 件数=%d",
                 criteria.specified_names(),
                 fmt,
                 output is not None,
+                list(fields) if fields else "すべて",
+                profile_db.has_chat_histories(conn),
                 len(rows),
             )
-            write_results(rows, fmt, output)
+            write_results(rows, fmt, output, fields or ALL_COLUMNS)
             if output is not None:
                 print(f"{len(rows)} 件を {output} に書き出しました")
         except profile_db.DbNotFound as exc:
@@ -297,6 +320,97 @@ class WithAutoReplyShell(cmd.Cmd):
 
     def help_search_profiles(self) -> None:
         print(SEARCH_PROFILES_USAGE)
+
+    def do_check_chats(self, arg: str) -> None:
+        try:
+            args = docopt(CHECK_CHATS_USAGE, argv=shlex.split(arg), default_help=False)
+            count = _parse_non_negative_int(args["<count>"], "<count>")
+            if count == 0:
+                raise UsageError("<count> には1以上の整数を指定してください")
+        except UsageError as exc:
+            print(exc)
+            print(CHECK_CHATS_USAGE)
+            return
+        except (DocoptExit, ValueError):
+            print(CHECK_CHATS_USAGE)
+            return
+
+        user_id = args["--user-id"]
+        if user_id is not None:
+            count = None  # 対象が1人になるので件数は意味を持たない
+        counts = {"me": 0, "other": 0, "none": 0, "failed": 0}
+        conn = None
+        db_path = None
+
+        def print_summary(prefix: str) -> None:
+            print(
+                f"{prefix}: 自分 {counts['me']} 件、相手 {counts['other']} 件、"
+                f"未送信 {counts['none']} 件、失敗 {counts['failed']} 件（DB: {db_path}）"
+            )
+            logger.info("check_chats %s: %s", prefix, counts)
+
+        try:
+            login_config = load_login_config(require_credentials=False)
+            list_config = load_list_config()
+            db_path = load_db_config().path
+            # connect() は空の DB を作ってしまうので、先に存在を確かめる
+            if not Path(db_path).is_file():
+                logger.warning("DBファイルがありません")
+                print(f"DBファイル {db_path} がありません。先に save_profiles を実行してください")
+                return
+            conn = profile_db.connect(db_path)
+            targets = profile_db.list_profile_targets(conn, limit=count, user_id=user_id)
+            if not targets:
+                if user_id is not None:
+                    print(f"ユーザーID {user_id} のプロフィールは保存されていません。先に save_profiles を実行してください")
+                else:
+                    print("保存済みのプロフィールがありません。先に save_profiles を実行してください")
+                return
+
+            logger.info("check_chats を開始します（対象 %d 人、user_id 指定=%s）", len(targets), user_id is not None)
+            page = self._ensure_page()
+            for i, result in enumerate(
+                check_chats(
+                    page,
+                    conn,
+                    login_config.site_url,
+                    targets,
+                    min_sleep_seconds=list_config.min_sleep_seconds,
+                    max_sleep_seconds=list_config.max_sleep_seconds,
+                ),
+                start=1,
+            ):
+                target = f"{result.user_id} {result.nickname or ''}".rstrip()
+                if result.summary is None:
+                    counts["failed"] += 1
+                    print(f"[{i}] 失敗: {target}（{result.reason}）")
+                    continue
+                summary = result.summary
+                counts[CHECK_COUNT_KEYS[summary.last_sender]] += 1
+                print(
+                    f"[{i}] {LAST_SENDER_LABELS[summary.last_sender]}: {target}"
+                    f"（自分 {summary.my_count} / 相手 {summary.other_count} / 合計 {summary.total_count}）"
+                )
+            print_summary("完了")
+        except TooManyFailures as exc:
+            logger.exception("チャットの確認を中止しました")
+            print(f"{exc}。ログインが切れている可能性があるため中止しました")
+            print_summary("中止")
+        except KeyboardInterrupt:
+            # ここで捕捉しないと main() まで伝わりシェルが終了する
+            logger.warning("check_chats が中断されました")
+            print()
+            print_summary("中断")
+        except Exception as exc:
+            logger.exception("チャットの確認に失敗しました")
+            print(f"チャットの確認に失敗しました: {exc}")
+            print_summary("失敗で終了")
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def help_check_chats(self) -> None:
+        print(CHECK_CHATS_USAGE)
 
     def do_chat(self, arg: str) -> None:
         "チャット履歴(JSONファイル)から返信文の下書きを作成する（送信はしません）\n使い方: chat <チャット履歴のJSONファイルパス>"

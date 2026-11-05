@@ -41,7 +41,9 @@ Windows では `run.bat` を使う。プロジェクトルートへ移動し、`
 | `list_items.py` | メッセージ一覧の取得（ページネーション） |
 | `user_profile.py` | 相手ユーザーのユーザーページからプロフィールを取得 |
 | `profile_collector.py` | 一覧の相手のプロフィールを取得して DB に保存（`save_profiles`） |
-| `profile_db.py` | プロフィール DB（SQLite）の接続・保存・検索 |
+| `chat_messages.py` | チャットページの HTML からメッセージ（送信者・本文）を取り出す |
+| `chat_history.py` | 最後の送信者・メッセージ件数の判定と記録（`check_chats`） |
+| `profile_db.py` | プロフィール・チャット履歴 DB（SQLite）の接続・保存・検索 |
 | `profile_export.py` | 検索結果の JSON / CSV 出力（`search_profiles`） |
 | `chat_reply.py` | Claude API による返信文下書きの生成 |
 | `logging_config.py` | `logs/YYYYMMDD_HHMMSS.log` と標準出力へのログ設定 |
@@ -66,10 +68,19 @@ Windows では `run.bat` を使う。プロジェクトルートへ移動し、`
   - 検索のキーワードは `json_each()` で JSON の値だけを照合する。基本情報の項目名に一致させないためである。
   - 検索は `connect_readonly()`（`mode=ro`）で開き、DBファイルがなければ作らずに `DbNotFound` を送出する。
   - 仕様は [docs/specs/profile-search/](specs/profile-search/)。
+- **チャットメッセージの解析**: `chat_messages.parse_chat_messages()` は `.message_balloon[data-sender]` を文書順に取り出し、`data-sender` の `me` / `partner` を `me` / `other` に読み替える。本文は吹き出し直下の `<p>` だけから取る（送信時刻・サムネイルを含めないため）。本文の整形は `user_profile._block_text()` を使い回す。HTML に含まれている分だけを対象にし、古いメッセージを遡って読み込むことはしない。仕様は [docs/specs/chat-message-parse/](specs/chat-message-parse/)。
+- **チャット履歴（`check_chats`）**: `chat_history.check_chats()` は `save_profiles()` と同じ構造（相手ごとにランダムsleep → `/messages/<user_id>` を開く → 1人ごとに commit、3人連続失敗で `TooManyFailures`）。`.messages` が現れなければ `ChatPageNotFound` とし、メッセージ0件（未送信）と区別する。ページ上でクリック・入力はしない。
+  - テーブル `chat_histories` は `profile_id`（UNIQUE、`profiles.user_id` への外部キー）で1人1行。`last_sender`（0 未送信 / 1 自分 / 2 相手）と `my_message_count` / `other_message_count`、`checked_at` を持つ。合計件数は保存せず、読み出すときに和で求める。
+  - `profile_db.connect()` は `PRAGMA foreign_keys = ON` を実行し、`profiles` と `chat_histories` を `CREATE TABLE IF NOT EXISTS` する（既存のDBにもテーブルが追加される）。
+  - `profile_db` から `chat_history` は型注釈（`TYPE_CHECKING`）でだけ参照する。`chat_history` が `profile_db` を import するため、循環 import を避ける。
+  - 仕様は [docs/specs/chat-history-check/](specs/chat-history-check/)。
+- **検索結果のチャット履歴と `--fields`**: `search_profiles()` は `profiles AS p` に `chat_histories AS c` を LEFT JOIN し、末尾に `last_sender` / `chat_checked_at` / `my_message_count` / `other_message_count` / `total_message_count` を加える。`chat_histories` がない古いDB（読み取り専用なので作れない）では `sqlite_master` で確かめ、JOIN せずに `NULL AS ...` を返す。WHERE 句の列名は `p.` 付きにする。出力するキーは `profile_export.ALL_COLUMNS` が正で、`--fields` は `parse_fields()` でこれと照合し、書き出しの直前だけで絞る。仕様は [docs/specs/profile-search-chat-fields/](specs/profile-search-chat-fields/)。
 - **検索結果の出力**: ログは標準エラーに出る（`logging_config.py` の `StreamHandler()`）。そのため、`search_profiles` が標準出力に出すのは結果だけにし、他のツールにそのまま渡せるようにする。CSV は、ファイルなら BOM 付き UTF-8 と `\r\n`、標準出力なら `\n` で書く。Windows では標準出力の `\n` が `\r\n` に変換されるためである。
 - **確認用スクリプト**: `scripts/` 配下のスクリプトは、サイトにアクセスせずに期待値と比べ、違う項目があれば終了コード1で終わる。プロジェクトルートから `PYTHONPATH=src python scripts/<名前>.py` で実行する。
   - `check_user_profile.py`: `sample/htiw_user_page.html` を `parse_user_profile()` で解析した結果を確かめる。セレクタを直した後に実行すること。
   - `check_profile_save.py`: DB への保存と `save_profiles()` の流れを確かめる。一覧・プロフィール取得・sleep は差し替える。
-  - `check_profile_search.py`: 検索条件・JSON / CSV 出力・性能（1,000件）を確かめる。
+  - `check_profile_search.py`: 検索条件・JSON / CSV 出力・性能（1,000件）・チャット履歴のキーと `--fields` を確かめる。
+  - `check_chat_messages.py`: `sample/user_chat_message_page.html` を `parse_chat_messages()` で解析した結果を確かめる。
+  - `check_chat_history.py`: 最後の送信者・件数の判定、`chat_histories` の保存、`check_chats()` の流れを確かめる。ページは偽のオブジェクトで差し替える。
 - **返信文の下書き**: `chat_reply.py` は入力 JSON（`[{"sender", "text"}]`）を `sender: text` 形式のテキストに変換し、`SYSTEM_PROMPT` とともに Messages API へ1回だけ送って本文を返す。送信処理は持たない。モデル名は `MODEL` 定数で指定する。プロンプトを変える際は [docs/prompt-guidelines.md](prompt-guidelines.md) に従う（元になった方針は `prompts/chat.md`）。
 - **README の表示**: `readme` コマンドは `shell.py` から2階層上（プロジェクトルート）の `README.md` を読む。`shell.py` を別の階層へ移す場合は `README_PATH` も直すこと。
